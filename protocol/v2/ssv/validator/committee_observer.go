@@ -22,6 +22,7 @@ import (
 	"github.com/ssvlabs/ssv/message/validation"
 	"github.com/ssvlabs/ssv/networkconfig"
 	"github.com/ssvlabs/ssv/observability/log/fields"
+	protocolp2p "github.com/ssvlabs/ssv/protocol/v2/p2p"
 	qbftcontroller "github.com/ssvlabs/ssv/protocol/v2/qbft/controller"
 	"github.com/ssvlabs/ssv/protocol/v2/ssv"
 	"github.com/ssvlabs/ssv/protocol/v2/ssv/queue"
@@ -46,6 +47,8 @@ type CommitteeObserver struct {
 
 	// cache to identify and skip duplicate computations of attester/sync committee roots
 	beaconVoteRoots *ttlcache.Cache[BeaconVoteCacheKey, struct{}]
+	// cache to identify and skip duplicate computations of aggregator/sync committee contribution roots
+	aggregatorCommitteeRoots *ttlcache.Cache[AggregatorCommitteeCacheKey, struct{}]
 
 	// TODO: consider using round-robin container as []map[phase0.ValidatorIndex]*ssv.PartialSigContainer similar to what is used in OperatorState
 	postConsensusContainer map[phase0.Slot]map[phase0.ValidatorIndex]*ssv.PartialSigContainer
@@ -58,11 +61,18 @@ type BeaconVoteCacheKey struct {
 	height specqbft.Height
 }
 
+// AggregatorCommitteeCacheKey is a composite key for identifying a unique call
+// to computing aggregator committee roots.
+type AggregatorCommitteeCacheKey struct {
+	root   phase0.Root
+	height specqbft.Height
+}
+
 type CommitteeObserverOptions struct {
 	FullNode             bool
 	Logger               *zap.Logger
 	BeaconConfig         *networkconfig.Beacon
-	Network              specqbft.Network
+	Network              protocolp2p.Network
 	Storage              *storage.ParticipantStores
 	OperatorSigner       ssvtypes.OperatorSigner
 	NewDecidedHandler    qbftcontroller.NewDecidedHandler
@@ -72,6 +82,7 @@ type CommitteeObserverOptions struct {
 	SyncCommRoots        *ttlcache.Cache[phase0.Root, struct{}]
 	SyncCommContribRoots *ttlcache.Cache[phase0.Root, struct{}]
 	BeaconVoteRoots      *ttlcache.Cache[BeaconVoteCacheKey, struct{}]
+	AggregatorCommRoots  *ttlcache.Cache[AggregatorCommitteeCacheKey, struct{}]
 	DomainCache          *DomainCache
 }
 
@@ -79,18 +90,19 @@ func NewCommitteeObserver(msgID spectypes.MessageID, opts CommitteeObserverOptio
 	// TODO: does the specific operator matters?
 
 	co := &CommitteeObserver{
-		msgID:                msgID,
-		logger:               opts.Logger,
-		Storage:              opts.Storage,
-		beaconConfig:         opts.BeaconConfig,
-		ValidatorStore:       opts.ValidatorStore,
-		newDecidedHandler:    opts.NewDecidedHandler,
-		attesterRoots:        opts.AttesterRoots,
-		aggregatorRoots:      opts.AggregatorRoots,
-		syncCommRoots:        opts.SyncCommRoots,
-		syncCommContribRoots: opts.SyncCommContribRoots,
-		domainCache:          opts.DomainCache,
-		beaconVoteRoots:      opts.BeaconVoteRoots,
+		msgID:                    msgID,
+		logger:                   opts.Logger,
+		Storage:                  opts.Storage,
+		beaconConfig:             opts.BeaconConfig,
+		ValidatorStore:           opts.ValidatorStore,
+		newDecidedHandler:        opts.NewDecidedHandler,
+		attesterRoots:            opts.AttesterRoots,
+		aggregatorRoots:          opts.AggregatorRoots,
+		syncCommRoots:            opts.SyncCommRoots,
+		syncCommContribRoots:     opts.SyncCommContribRoots,
+		domainCache:              opts.DomainCache,
+		beaconVoteRoots:          opts.BeaconVoteRoots,
+		aggregatorCommitteeRoots: opts.AggregatorCommRoots,
 	}
 
 	co.postConsensusContainer = make(map[phase0.Slot]map[phase0.ValidatorIndex]*ssv.PartialSigContainer, co.postConsensusContainerCapacity())
@@ -434,12 +446,26 @@ func (ncv *CommitteeObserver) SaveRoots(ctx context.Context, msg *queue.SSVMessa
 			return err
 		}
 
+		consRoot, err := consData.HashTreeRoot()
+		if err != nil {
+			ncv.logger.Debug("❗ failed to compute aggregator committee consensus data root", zap.Error(err))
+			return err
+		}
+		aggCacheKey := AggregatorCommitteeCacheKey{root: consRoot, height: qbftMsg.Height}
+		// if the roots for this consensus data and height have already been computed, skip
+		if ncv.aggregatorCommitteeRoots.Has(aggCacheKey) {
+			return nil
+		}
+
 		if err := ncv.saveAggregatorRoots(ctx, epoch, consData); err != nil {
 			return err
 		}
 		if err := ncv.saveSyncCommContribRoots(ctx, epoch, consData); err != nil {
 			return err
 		}
+
+		// cache the roots for this consensus data and height
+		ncv.aggregatorCommitteeRoots.Set(aggCacheKey, struct{}{}, ttlcache.DefaultTTL)
 		return nil
 	default:
 		return nil

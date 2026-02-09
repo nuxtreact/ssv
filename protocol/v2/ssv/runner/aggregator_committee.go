@@ -28,6 +28,7 @@ import (
 	"github.com/ssvlabs/ssv/observability"
 	"github.com/ssvlabs/ssv/observability/log/fields"
 	"github.com/ssvlabs/ssv/protocol/v2/blockchain/beacon"
+	protocolp2p "github.com/ssvlabs/ssv/protocol/v2/p2p"
 	"github.com/ssvlabs/ssv/protocol/v2/qbft/controller"
 	"github.com/ssvlabs/ssv/protocol/v2/ssv"
 	ssvtypes "github.com/ssvlabs/ssv/protocol/v2/types"
@@ -36,7 +37,7 @@ import (
 // AggregatorCommitteeRunner has no DutyGuard because AggregatorCommitteeRunner's duties aren't slashable.
 type AggregatorCommitteeRunner struct {
 	BaseRunner     *BaseRunner
-	network        specqbft.Network
+	network        protocolp2p.Network
 	beacon         beacon.BeaconNode
 	signer         ekm.BeaconSigner
 	operatorSigner ssvtypes.OperatorSigner
@@ -49,6 +50,8 @@ type AggregatorCommitteeRunner struct {
 	// For aggregator role: tracks by validator index only (one submission per validator)
 	// For sync committee contribution role: tracks by validator index and root (multiple submissions per validator)
 	submittedDuties map[spectypes.BeaconRole]map[phase0.ValidatorIndex]map[[32]byte]struct{}
+	// rootToSyncCommitteeIdx is the root->sync committee index mapping for the current duty.
+	rootToSyncCommitteeIdx map[phase0.Root]phase0.CommitteeIndex
 
 	// IsAggregator is an exported struct field, so it can be mocked out for easy testing.
 	IsAggregator func(
@@ -65,7 +68,7 @@ func NewAggregatorCommitteeRunner(
 	share map[phase0.ValidatorIndex]*spectypes.Share,
 	qbftController *controller.Controller,
 	beacon beacon.BeaconNode,
-	network specqbft.Network,
+	network protocolp2p.Network,
 	signer ekm.BeaconSigner,
 	operatorSigner ssvtypes.OperatorSigner,
 ) (Runner, error) {
@@ -139,7 +142,7 @@ func (r *AggregatorCommitteeRunner) MarshalJSON() ([]byte, error) {
 	type AggregatorCommitteeRunnerAlias struct {
 		BaseRunner     *BaseRunner
 		beacon         beacon.BeaconNode
-		network        specqbft.Network
+		network        protocolp2p.Network
 		signer         ekm.BeaconSigner
 		operatorSigner ssvtypes.OperatorSigner
 		valCheck       ssv.ValueChecker
@@ -164,7 +167,7 @@ func (r *AggregatorCommitteeRunner) UnmarshalJSON(data []byte) error {
 	type AggregatorCommitteeRunnerAlias struct {
 		BaseRunner     *BaseRunner
 		beacon         beacon.BeaconNode
-		network        specqbft.Network
+		network        protocolp2p.Network
 		signer         ekm.BeaconSigner
 		operatorSigner ssvtypes.OperatorSigner
 		valCheck       ssv.ValueChecker
@@ -221,7 +224,7 @@ func (r *AggregatorCommitteeRunner) GetBeaconNode() beacon.BeaconNode {
 	return r.beacon
 }
 
-func (r *AggregatorCommitteeRunner) GetNetwork() specqbft.Network {
+func (r *AggregatorCommitteeRunner) GetNetwork() protocolp2p.Network {
 	return r.network
 }
 
@@ -277,7 +280,7 @@ func (r *AggregatorCommitteeRunner) waitTwoThirdsIntoSlot(ctx context.Context, s
 func (r *AggregatorCommitteeRunner) processSyncCommitteeSelectionProof(
 	ctx context.Context,
 	selectionProof phase0.BLSSignature,
-	validatorSyncCommitteeIndex uint64,
+	validatorSyncCommitteeIndex phase0.CommitteeIndex,
 	vDuty *spectypes.ValidatorDuty,
 	aggregatorData *spectypes.AggregatorCommitteeConsensusData,
 ) (bool, error) {
@@ -285,7 +288,7 @@ func (r *AggregatorCommitteeRunner) processSyncCommitteeSelectionProof(
 		return false, nil // Not selected as sync committee aggregator
 	}
 
-	subnetID := r.beacon.SyncCommitteeSubnetID(phase0.CommitteeIndex(validatorSyncCommitteeIndex))
+	subnetID := r.beacon.SyncCommitteeSubnetID(validatorSyncCommitteeIndex)
 
 	// Check if we already have a contribution for this sync committee subnet ID
 	for _, contrib := range aggregatorData.SyncCommitteeContributions {
@@ -359,14 +362,14 @@ func (r *AggregatorCommitteeRunner) ProcessPreConsensus(
 	r.measurements.EndPreConsensus()
 	recordPreConsensusDuration(ctx, r.measurements.PreConsensusTime(), spectypes.RoleAggregatorCommittee)
 
-	aggregatorMap, contributionMap, err := r.expectedPreConsensusRoots(ctx)
+	aggregatorMap, contributionMap, err := r.expectedPreConsensusRoots(ctx, logger)
 	if err != nil {
 		return fmt.Errorf("could not get expected pre-consensus roots: %w", err)
 	}
 
 	duty := r.state().CurrentDuty.(*spectypes.AggregatorCommitteeDuty)
 	epoch := r.BaseRunner.NetworkConfig.EstimatedEpochAtSlot(duty.DutySlot())
-	dataVersion, _ := r.GetBaseRunner().NetworkConfig.ForkAtEpoch(epoch)
+	dataVersion, _ := r.GetBaseRunner().NetworkConfig.BeaconForkAtEpoch(epoch)
 	consensusData := &spectypes.AggregatorCommitteeConsensusData{
 		Version: dataVersion,
 	}
@@ -484,10 +487,16 @@ func (r *AggregatorCommitteeRunner) ProcessPreConsensus(
 			case spectypes.BNRoleSyncCommitteeContribution:
 				vDuty := r.findValidatorDuty(validatorIndex, spectypes.BNRoleSyncCommitteeContribution)
 				if vDuty != nil {
+					scIndex, ok := r.rootToSyncCommitteeIdx[root]
+					if !ok {
+						logger.Warn("root got a quorum, but is unknown to us", fields.Root(root))
+						continue
+					}
+
 					isAggregator, err := r.processSyncCommitteeSelectionProof(
 						ctx,
 						blsSig,
-						metadata.ValidatorSyncCommitteeIndex,
+						scIndex,
 						vDuty,
 						consensusData,
 					)
@@ -581,11 +590,13 @@ func (r *AggregatorCommitteeRunner) ProcessPreConsensus(
 		consensusData,
 		r.ValCheck,
 	); err != nil {
+		r.measurements.EndConsensus()
 		return fmt.Errorf("failed to start consensus: %w", err)
 	}
 
 	// Raise error if any
 	if anyErr != nil {
+		r.measurements.EndConsensus()
 		return anyErr
 	}
 
@@ -779,7 +790,7 @@ func (r *AggregatorCommitteeRunner) ProcessPostConsensus(
 
 	span.AddEvent("getting aggregations, sync committee contributions and root beacon objects")
 	// Get validator-root maps for attestations and sync committees, and the root-beacon object map
-	aggregatorMap, contributionMap, beaconObjects, err := r.expectedPostConsensusRootsAndBeaconObjects(ctx)
+	aggregatorMap, contributionMap, beaconObjects, err := r.expectedPostConsensusRootsAndBeaconObjects(ctx, logger)
 	if err != nil {
 		return fmt.Errorf("could not get expected post consensus roots and beacon objects: %w", err)
 	}
@@ -1040,7 +1051,7 @@ func (r *AggregatorCommitteeRunner) ProcessPostConsensus(
 	}
 
 	// Check if duty has terminated (runner has submitted for all duties)
-	if r.HasSubmittedAllDuties(ctx) {
+	if r.HasSubmittedAllDuties(ctx, logger) {
 		r.state().Finished = true
 		r.measurements.EndDutyFlow()
 		recordTotalDutyDuration(ctx, r.measurements.TotalDutyTime(), spectypes.RoleAggregatorCommittee, r.state().RunningInstance.State.Round)
@@ -1080,54 +1091,34 @@ func (r *AggregatorCommitteeRunner) OnTimeoutQBFT(
 // For aggregator role we expect exactly one submission per validator.
 // For sync committee contribution role we expect one submission per expected root
 // (i.e., per subcommittee index assigned to that validator for this slot).
-func (r *AggregatorCommitteeRunner) HasSubmittedAllDuties(ctx context.Context) bool {
-	duty := r.state().CurrentDuty.(*spectypes.AggregatorCommitteeDuty)
-
+func (r *AggregatorCommitteeRunner) HasSubmittedAllDuties(ctx context.Context, logger *zap.Logger) bool {
 	// Build the expected post-consensus roots per validator/role from the decided data.
-	aggregatorMap, contributionMap, _, err := r.expectedPostConsensusRootsAndBeaconObjects(ctx)
+	aggregatorMap, contributionMap, _, err := r.expectedPostConsensusRootsAndBeaconObjects(ctx, logger)
 	if err != nil {
 		// If we can't resolve the expected set, do not finish yet.
 		return false
 	}
 
-	for _, vDuty := range duty.ValidatorDuties {
-		if vDuty == nil {
-			continue
-		}
-
+	// Use decided data as the source of truth; non-selected validators won't appear here.
+	for validatorIndex, expectedRoot := range aggregatorMap {
 		// Only consider validators this operator actually runs.
-		if _, hasShare := r.BaseRunner.Share[vDuty.ValidatorIndex]; !hasShare {
+		if _, hasShare := r.BaseRunner.Share[validatorIndex]; !hasShare {
 			continue
 		}
-
-		switch vDuty.Type {
-		case spectypes.BNRoleAggregator:
-			// Expect exactly one aggregate root for this validator.
-			expectedRoot, ok := aggregatorMap[vDuty.ValidatorIndex]
-			if !ok {
-				// If consensus did not include this validator's aggregate, we haven't finished.
-				return false
-			}
-			if !r.HasSubmitted(spectypes.BNRoleAggregator, vDuty.ValidatorIndex, expectedRoot) {
-				return false
-			}
-
-		case spectypes.BNRoleSyncCommitteeContribution:
-			// Expect a submission for every contribution root assigned to this validator.
-			expectedRoots, ok := contributionMap[vDuty.ValidatorIndex]
-			if !ok || len(expectedRoots) == 0 {
-				// The duty indicates sync committee work but no expected roots were found.
-				return false
-			}
-			for _, root := range expectedRoots {
-				if !r.HasSubmitted(spectypes.BNRoleSyncCommitteeContribution, vDuty.ValidatorIndex, root) {
-					return false
-				}
-			}
-
-		default:
-			// Unknown role type: don't allow finishing.
+		if !r.HasSubmitted(spectypes.BNRoleAggregator, validatorIndex, expectedRoot) {
 			return false
+		}
+	}
+
+	for validatorIndex, expectedRoots := range contributionMap {
+		// Only consider validators this operator actually runs.
+		if _, hasShare := r.BaseRunner.Share[validatorIndex]; !hasShare {
+			continue
+		}
+		for _, root := range expectedRoots {
+			if !r.HasSubmitted(spectypes.BNRoleSyncCommitteeContribution, validatorIndex, root) {
+				return false
+			}
 		}
 	}
 
@@ -1184,7 +1175,10 @@ func (r *AggregatorCommitteeRunner) expectedPostConsensusRootsAndDomain(context.
 
 // expectedPreConsensusRoots returns the expected roots for the pre-consensus phase.
 // It returns the aggregator and sync committee validator to root maps.
-func (r *AggregatorCommitteeRunner) expectedPreConsensusRoots(ctx context.Context) (
+func (r *AggregatorCommitteeRunner) expectedPreConsensusRoots(
+	ctx context.Context,
+	logger *zap.Logger,
+) (
 	aggregatorMap map[phase0.ValidatorIndex][32]byte,
 	contributionMap map[phase0.ValidatorIndex]map[ValidatorSyncCommitteeIndex][32]byte,
 	err error,
@@ -1203,6 +1197,10 @@ func (r *AggregatorCommitteeRunner) expectedPreConsensusRoots(ctx context.Contex
 		case spectypes.BNRoleAggregator:
 			root, err := r.expectedAggregatorSelectionRoot(ctx, duty.Slot)
 			if err != nil {
+				logger.Debug("failed to compute aggregator selection root",
+					zap.Uint64("validator_index", uint64(vDuty.ValidatorIndex)),
+					zap.Error(err),
+				)
 				continue
 			}
 			aggregatorMap[vDuty.ValidatorIndex] = root
@@ -1215,6 +1213,11 @@ func (r *AggregatorCommitteeRunner) expectedPreConsensusRoots(ctx context.Contex
 			for _, index := range vDuty.ValidatorSyncCommitteeIndices {
 				root, err := r.expectedSyncCommitteeSelectionRoot(ctx, duty.Slot, index)
 				if err != nil {
+					logger.Debug("failed to compute sync committee selection root",
+						zap.Uint64("validator_index", uint64(vDuty.ValidatorIndex)),
+						zap.Uint64("subcommittee_index", index),
+						zap.Error(err),
+					)
 					continue
 				}
 				contributionMap[vDuty.ValidatorIndex][index] = root
@@ -1265,7 +1268,10 @@ func (r *AggregatorCommitteeRunner) expectedSyncCommitteeSelectionRoot(
 	return spectypes.ComputeETHSigningRoot(data, domain)
 }
 
-func (r *AggregatorCommitteeRunner) expectedPostConsensusRootsAndBeaconObjects(ctx context.Context) (
+func (r *AggregatorCommitteeRunner) expectedPostConsensusRootsAndBeaconObjects(
+	ctx context.Context,
+	logger *zap.Logger,
+) (
 	aggregatorMap map[phase0.ValidatorIndex][32]byte,
 	contributionMap map[phase0.ValidatorIndex][][32]byte,
 	beaconObjects map[phase0.ValidatorIndex]map[[32]byte]interface{}, err error,
@@ -1292,17 +1298,29 @@ func (r *AggregatorCommitteeRunner) expectedPostConsensusRootsAndBeaconObjects(c
 		validatorIndex := consensusData.Aggregators[i].ValidatorIndex
 		hashRoot, err := spectypes.GetAggregateAndProofHashRoot(aggregateAndProof)
 		if err != nil {
+			logger.Debug("failed to compute aggregate and proof hash root",
+				zap.Uint64("validator_index", uint64(validatorIndex)),
+				zap.Error(err),
+			)
 			continue
 		}
 
 		// Calculate signing root for aggregate and proof
 		domain, err := r.beacon.DomainData(ctx, epoch, spectypes.DomainAggregateAndProof)
 		if err != nil {
+			logger.Debug("failed to get aggregate and proof domain",
+				zap.Uint64("validator_index", uint64(validatorIndex)),
+				zap.Error(err),
+			)
 			continue
 		}
 
 		root, err := spectypes.ComputeETHSigningRoot(hashRoot, domain)
 		if err != nil {
+			logger.Debug("failed to compute aggregate and proof signing root",
+				zap.Uint64("validator_index", uint64(validatorIndex)),
+				zap.Error(err),
+			)
 			continue
 		}
 
@@ -1333,11 +1351,21 @@ func (r *AggregatorCommitteeRunner) expectedPostConsensusRootsAndBeaconObjects(c
 		// Calculate signing root
 		domain, err := r.beacon.DomainData(ctx, epoch, spectypes.DomainContributionAndProof)
 		if err != nil {
+			logger.Debug("failed to get contribution and proof domain",
+				zap.Uint64("validator_index", uint64(validatorIndex)),
+				zap.Uint64("subcommittee_index", contribution.Contribution.SubcommitteeIndex),
+				zap.Error(err),
+			)
 			continue
 		}
 
 		root, err := spectypes.ComputeETHSigningRoot(contribAndProof, domain)
 		if err != nil {
+			logger.Debug("failed to compute contribution and proof signing root",
+				zap.Uint64("validator_index", uint64(validatorIndex)),
+				zap.Uint64("subcommittee_index", contribution.Contribution.SubcommitteeIndex),
+				zap.Error(err),
+			)
 			continue
 		}
 
@@ -1540,6 +1568,8 @@ func (r *AggregatorCommitteeRunner) executeDuty(ctx context.Context, logger *zap
 		Messages: []*spectypes.PartialSignatureMessage{},
 	}
 
+	r.rootToSyncCommitteeIdx = make(map[phase0.Root]phase0.CommitteeIndex)
+
 	// Generate selection proofs for all validators and duties
 	for _, vDuty := range aggCommitteeDuty.ValidatorDuties {
 		switch vDuty.Type {
@@ -1584,6 +1614,7 @@ func (r *AggregatorCommitteeRunner) executeDuty(ctx context.Context, logger *zap
 				}
 
 				msg.Messages = append(msg.Messages, partialSig)
+				r.rootToSyncCommitteeIdx[partialSig.SigningRoot] = phase0.CommitteeIndex(index)
 			}
 
 		default:

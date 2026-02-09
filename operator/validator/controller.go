@@ -103,7 +103,7 @@ type SharesStorage interface {
 }
 
 type P2PNetwork interface {
-	protocolp2p.Broadcaster
+	protocolp2p.Network
 	UseMessageRouter(router network.MessageRouter)
 	SubscribeRandoms(numSubnets int) error
 	ActiveSubnets() commons.Subnets
@@ -159,6 +159,7 @@ type Controller struct {
 	syncCommRoots        *ttlcache.Cache[phase0.Root, struct{}]
 	syncCommContribRoots *ttlcache.Cache[phase0.Root, struct{}]
 	beaconVoteRoots      *ttlcache.Cache[validator.BeaconVoteCacheKey, struct{}]
+	aggregatorCommRoots  *ttlcache.Cache[validator.AggregatorCommitteeCacheKey, struct{}]
 
 	domainCache *validator.DomainCache
 
@@ -249,6 +250,9 @@ func NewController(logger *zap.Logger, options ControllerOptions, exporterOption
 		beaconVoteRoots: ttlcache.New(
 			ttlcache.WithTTL[validator.BeaconVoteCacheKey, struct{}](cacheTTL),
 		),
+		aggregatorCommRoots: ttlcache.New(
+			ttlcache.WithTTL[validator.AggregatorCommitteeCacheKey, struct{}](cacheTTL),
+		),
 		indicesChangeCh:         make(chan struct{}),
 		validatorRegistrationCh: make(chan duties.RegistrationDescriptor),
 		validatorExitCh:         make(chan duties.ExitDescriptor),
@@ -273,6 +277,7 @@ func NewController(logger *zap.Logger, options ControllerOptions, exporterOption
 	go ctrl.syncCommContribRoots.Start()
 	go ctrl.domainCache.Start()
 	go ctrl.beaconVoteRoots.Start()
+	go ctrl.aggregatorCommRoots.Start()
 
 	return ctrl
 }
@@ -386,6 +391,7 @@ func (c *Controller) handleWorkerMessages(ctx context.Context, msg network.Decod
 			SyncCommContribRoots: c.syncCommContribRoots,
 			DomainCache:          c.domainCache,
 			BeaconVoteRoots:      c.beaconVoteRoots,
+			AggregatorCommRoots:  c.aggregatorCommRoots,
 		}
 
 		ncv = validator.NewCommitteeObserver(ssvMsg.GetID(), committeeObserverOptions)
@@ -1040,8 +1046,12 @@ func SetupCommitteeRunners(
 			BeaconSigner: options.Signer,
 			Domain:       options.NetworkConfig.DomainType,
 			ProposerF: func(state *specqbft.State, round specqbft.Round) spectypes.OperatorID {
-				leader := qbft.RoundRobinProposer(state, round)
-				return leader
+				if options.NetworkConfig.BooleForkAtSlot(phase0.Slot(state.Height)) {
+					committee := ssvtypes.OperatorIDsFromOperators(state.CommitteeMember.Committee)
+					return qbft.RoundRobinProposer(state.Height, round, committee, options.NetworkConfig)
+				}
+
+				return qbft.RoundRobinProposerPreBooleFork(state, round)
 			},
 			Network:     options.Network,
 			Timer:       roundtimer.New(ctx, options.NetworkConfig.Beacon, role, nil),
@@ -1121,8 +1131,12 @@ func SetupRunners(
 			BeaconSigner: options.Signer,
 			Domain:       options.NetworkConfig.DomainType,
 			ProposerF: func(state *specqbft.State, round specqbft.Round) spectypes.OperatorID {
-				leader := qbft.RoundRobinProposer(state, round)
-				return leader
+				if options.NetworkConfig.BooleForkAtSlot(phase0.Slot(state.Height)) {
+					committee := ssvtypes.OperatorIDsFromOperators(state.CommitteeMember.Committee)
+					return qbft.RoundRobinProposer(state.Height, round, committee, options.NetworkConfig)
+				}
+
+				return qbft.RoundRobinProposerPreBooleFork(state, round)
 			},
 			Network:     options.Network,
 			Timer:       roundtimer.New(ctx, options.NetworkConfig.Beacon, role, nil),
