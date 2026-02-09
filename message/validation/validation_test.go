@@ -464,7 +464,7 @@ func Test_ValidateSSVMessage(t *testing.T) {
 		_, err = validator.handleSignedSSVMessage(signedSSVMessage, topicID, peerID, receivedAt)
 		expectedErr := ErrWrongDomain
 		expectedErr.got = hex.EncodeToString(wrongDomain[:])
-		domain := netCfg.DomainTypeAtSlot(slot)
+		domain := netCfg.DomainTypeAtSlot(defaultSlot)
 		expectedErr.want = hex.EncodeToString(domain[:])
 		require.ErrorIs(t, err, expectedErr)
 	})
@@ -2003,37 +2003,6 @@ func generateSignedMessage(
 	}
 
 	leader := leaderForTest(ctx, qbftMessage.Height, qbftMessage.Round)
-	signedSSVMessage := spectestingutils.SignQBFTMsg(ks.OperatorKeys[leader], leader, qbftMessage)
-	signedSSVMessage.FullData = fullData
-
-	return signedSSVMessage
-}
-
-func generateSignedMessageWithLeader(
-	ks *spectestingutils.TestKeySet,
-	identifier spectypes.MessageID,
-	slot phase0.Slot,
-	leader spectypes.OperatorID,
-	opts ...func(message *specqbft.Message),
-) *spectypes.SignedSSVMessage {
-	fullData := spectestingutils.TestingQBFTFullData
-	height := specqbft.Height(slot)
-
-	qbftMessage := &specqbft.Message{
-		MsgType:    specqbft.ProposalMsgType,
-		Height:     height,
-		Round:      specqbft.FirstRound,
-		Identifier: identifier[:],
-		Root:       sha256.Sum256(fullData),
-
-		RoundChangeJustification: [][]byte{},
-		PrepareJustification:     [][]byte{},
-	}
-
-	for _, opt := range opts {
-		opt(qbftMessage)
-	}
-
 	signedSSVMessage := spectestingutils.SignQBFTMsg(ks.OperatorKeys[leader], leader, qbftMessage)
 	signedSSVMessage.FullData = fullData
 
