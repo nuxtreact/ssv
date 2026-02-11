@@ -112,7 +112,7 @@ func Test_ValidateSSVMessage(t *testing.T) {
 	defaultSlot := phase0.Slot(spectestingutils.TestingDutySlot)
 	topicID := shares.active.AlanCommitteeSubnet().AlanTopic()
 	if netCfg.BooleForkAtSlot(defaultSlot) {
-		topicID = shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.Beacon.Name)
+		topicID = shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.SSV.Name)
 	}
 
 	defaultEpoch := netCfg.EstimatedEpochAtSlot(defaultSlot)
@@ -502,7 +502,7 @@ func Test_ValidateSSVMessage(t *testing.T) {
 
 			badIdentifier := spectypes.NewMsgID(postBooleCfg.DomainTypeAtSlot(slot), shares.active.ValidatorPubKey[:], ssvtypes.RoleAggregator)
 			signedSSVMessage := generateSignedMessage(postBooleLeaderCtx, ks, badIdentifier, slot)
-			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.Beacon.Name)
+			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.SSV.Name)
 
 			receivedAt := postBooleCfg.SlotStartTime(slot)
 			_, err = validator.handleSignedSSVMessage(signedSSVMessage, booleTopicID, peerID, receivedAt)
@@ -516,7 +516,7 @@ func Test_ValidateSSVMessage(t *testing.T) {
 
 			badIdentifier := spectypes.NewMsgID(postBooleCfg.DomainTypeAtSlot(slot), shares.active.ValidatorPubKey[:], ssvtypes.RoleSyncCommitteeContribution)
 			signedSSVMessage := generateSignedMessage(postBooleLeaderCtx, ks, badIdentifier, slot)
-			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.Beacon.Name)
+			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.SSV.Name)
 
 			receivedAt := postBooleCfg.SlotStartTime(slot)
 			_, err = validator.handleSignedSSVMessage(signedSSVMessage, booleTopicID, peerID, receivedAt)
@@ -1240,7 +1240,7 @@ func Test_ValidateSSVMessage(t *testing.T) {
 			msgID := spectypes.NewMsgID(postBooleCfg.DomainTypeAtSlot(slot), encodedCommitteeID, spectypes.RoleAggregatorCommittee)
 			signedSSVMessage := generateSignedMessage(postBooleLeaderCtx, ks, msgID, slot)
 			receivedAt := postBooleCfg.SlotStartTime(slot + 35)
-			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.Beacon.Name)
+			booleTopicID := shares.active.BooleCommitteeSubnet().BooleTopic(postBooleCfg.SSV.Name)
 
 			_, err = validator.handleSignedSSVMessage(signedSSVMessage, booleTopicID, peerID, receivedAt)
 			require.ErrorContains(t, err, ErrLateSlotMessage.Error())
@@ -1641,13 +1641,13 @@ func Test_ValidateSSVMessage(t *testing.T) {
 			},
 			{
 				name:  "network topology topic / Alan config",
-				topic: shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.Beacon.Name),
+				topic: shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.SSV.Name),
 				cfg:   alanNetCfg,
 				err:   ErrIncorrectTopic,
 			},
 			{
 				name:  "network topology topic / network topology config",
-				topic: shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.Beacon.Name),
+				topic: shares.active.BooleCommitteeSubnet().BooleTopic(netCfg.SSV.Name),
 				cfg:   networkTopologyNetCfg,
 				err:   nil,
 			},
